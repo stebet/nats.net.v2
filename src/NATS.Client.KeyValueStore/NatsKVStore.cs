@@ -43,6 +43,7 @@ public class NatsKVStore : INatsKVStore
     private const string NatsSubject = "Nats-Subject";
     private const string NatsSequence = "Nats-Sequence";
     private const string NatsTimeStamp = "Nats-Time-Stamp";
+    private const string NatsTtl = "Nats-TTL";
     private static readonly Regex ValidKeyRegex = new(pattern: @"\A[-/_=\.a-zA-Z0-9]+\z", RegexOptions.Compiled);
     private static readonly NatsKVException MissingSequenceHeaderException = new("Missing sequence header");
     private static readonly NatsKVException MissingTimestampHeaderException = new("Missing timestamp header");
@@ -70,23 +71,33 @@ public class NatsKVStore : INatsKVStore
     public string Bucket { get; }
 
     /// <inheritdoc />
-    public async ValueTask<ulong> PutAsync<T>(string key, T value, INatsSerialize<T>? serializer = default, CancellationToken cancellationToken = default)
+    public async ValueTask<ulong> PutAsync<T>(string key, T value, TimeSpan ttl = default, INatsSerialize<T>? serializer = default, CancellationToken cancellationToken = default)
     {
         ValidateKey(key);
-        var ack = await JetStreamContext.PublishAsync($"$KV.{Bucket}.{key}", value, serializer: serializer, cancellationToken: cancellationToken);
+
+        NatsHeaders? headers = default;
+        if (ttl != default)
+        {
+            headers = new NatsHeaders
+            {
+                { NatsTtl, ttl == TimeSpan.MaxValue ? "never" : ttl.TotalSeconds.ToString("N0") },
+            };
+        }
+
+        var ack = await JetStreamContext.PublishAsync($"$KV.{Bucket}.{key}", value, serializer: serializer, headers: headers, cancellationToken: cancellationToken);
         ack.EnsureSuccess();
         return ack.Seq;
     }
 
     /// <inheritdoc />
-    public async ValueTask<ulong> CreateAsync<T>(string key, T value, INatsSerialize<T>? serializer = default, CancellationToken cancellationToken = default)
+    public async ValueTask<ulong> CreateAsync<T>(string key, T value, TimeSpan ttl = default, INatsSerialize<T>? serializer = default, CancellationToken cancellationToken = default)
     {
         ValidateKey(key);
 
         // First try to create a new entry
         try
         {
-            return await UpdateAsync(key, value, revision: 0, serializer, cancellationToken);
+            return await UpdateAsync(key, value, revision: 0, ttl, serializer, cancellationToken);
         }
         catch (NatsKVWrongLastRevisionException)
         {
@@ -99,17 +110,21 @@ public class NatsKVStore : INatsKVStore
         }
         catch (NatsKVKeyDeletedException e)
         {
-            return await UpdateAsync(key, value, e.Revision, serializer, cancellationToken);
+            return await UpdateAsync(key, value, e.Revision, ttl, serializer, cancellationToken);
         }
 
         throw new NatsKVCreateException();
     }
 
     /// <inheritdoc />
-    public async ValueTask<ulong> UpdateAsync<T>(string key, T value, ulong revision, INatsSerialize<T>? serializer = default, CancellationToken cancellationToken = default)
+    public async ValueTask<ulong> UpdateAsync<T>(string key, T value, ulong revision, TimeSpan ttl = default, INatsSerialize<T>? serializer = default, CancellationToken cancellationToken = default)
     {
         ValidateKey(key);
         var headers = new NatsHeaders { { NatsExpectedLastSubjectSequence, revision.ToString() } };
+        if (ttl != default)
+        {
+            headers.Add(NatsTtl, ttl == TimeSpan.MaxValue ? "never" : ttl.TotalSeconds.ToString("N0"));
+        }
 
         try
         {
